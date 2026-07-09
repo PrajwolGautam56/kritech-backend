@@ -72,6 +72,8 @@ Set `FRONTEND_URL` to the same public site URL so password reset emails generate
 - `PATCH /api/leads/:id`
 - `DELETE /api/leads/:id`
 - `POST /api/leads/bulk-email`
+- `GET /api/mail/status`
+- `POST /api/mail/test`
 - `GET /api/users`
 - `POST /api/users`
 - `PATCH /api/users/:id`

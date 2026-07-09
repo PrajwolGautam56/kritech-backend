@@ -37,7 +37,7 @@ const smtpConfig = {
     servername: process.env.SMTP_HOST
   } : undefined
 };
-const accessModules = ['posts', 'inquiries', 'leads', 'seo', 'sitemap', 'users'];
+const accessModules = ['posts', 'inquiries', 'leads', 'mail', 'seo', 'sitemap', 'users'];
 const mailer = smtpConfig.host ? nodemailer.createTransport(smtpConfig) : null;
 
 app.use(cors({
@@ -722,6 +722,44 @@ app.post('/api/leads/bulk-email', requireAdmin, requirePermission('leads'), asyn
     response.json({ ok: true, sent: results.length, failed: failures.length, results, failures });
   } catch (error) {
     response.status(500).json({ message: error.message });
+  }
+});
+
+app.get('/api/mail/status', requireAdmin, requirePermission('mail'), (_request, response) => {
+  response.json({
+    configured: Boolean(mailer && smtpConfig.host && smtpConfig.auth),
+    host: smtpConfig.host || '',
+    port: smtpConfig.port,
+    secure: smtpConfig.secure,
+    user: process.env.SMTP_USER || '',
+    from: mailFrom,
+    timeouts: {
+      connection: smtpConfig.connectionTimeout,
+      greeting: smtpConfig.greetingTimeout,
+      socket: smtpConfig.socketTimeout
+    }
+  });
+});
+
+app.post('/api/mail/test', requireAdmin, requirePermission('mail'), async (request, response) => {
+  try {
+    const to = String(request.body?.to || request.admin?.email || adminEmail || '').trim().toLowerCase();
+    if (!to) {
+      response.status(400).json({ message: 'Test recipient email is required.' });
+      return;
+    }
+
+    const sentAt = new Date().toISOString();
+    await sendMail({
+      to,
+      subject: 'Kritech SMTP test email',
+      text: `Kritech mail delivery is working.\n\nSent at: ${sentAt}\nFrom: ${mailFrom}`,
+      html: `<p>Kritech mail delivery is working.</p><p><strong>Sent at:</strong> ${sentAt}</p><p><strong>From:</strong> ${mailFrom}</p>`
+    });
+
+    response.json({ ok: true, message: `Test email sent to ${to}.` });
+  } catch (error) {
+    response.status(502).json({ message: error.message });
   }
 });
 
