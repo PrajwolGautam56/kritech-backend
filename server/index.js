@@ -3,6 +3,7 @@ import cors from 'cors';
 import crypto from 'node:crypto';
 import express from 'express';
 import { ObjectId } from 'mongodb';
+import nodemailer from 'nodemailer';
 import { getDb, pingDb } from './mongo.js';
 
 const app = express();
@@ -19,7 +20,19 @@ const adminEmail = process.env.ADMIN_EMAIL;
 const adminPasswordSalt = process.env.ADMIN_PASSWORD_SALT;
 const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
 const adminTokenSecret = process.env.ADMIN_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
-const accessModules = ['posts', 'inquiries', 'seo', 'sitemap', 'users'];
+const frontendUrl = process.env.FRONTEND_URL || clientOrigins[0] || 'http://127.0.0.1:5173';
+const mailFrom = process.env.MAIL_FROM || process.env.SMTP_USER || 'Kritech Solution <no-reply@kritechsolution.com>';
+const smtpConfig = {
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
+  auth: process.env.SMTP_USER && process.env.SMTP_PASS ? {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  } : undefined
+};
+const accessModules = ['posts', 'inquiries', 'leads', 'seo', 'sitemap', 'users'];
+const mailer = smtpConfig.host ? nodemailer.createTransport(smtpConfig) : null;
 
 app.use(cors({
   origin(origin, callback) {
@@ -45,8 +58,20 @@ function inquiriesCollection(db) {
   return db.collection('inquiries');
 }
 
+function leadsCollection(db) {
+  return db.collection('leads');
+}
+
 function usersCollection(db) {
   return db.collection('users');
+}
+
+function authCollection(db) {
+  return db.collection('auth');
+}
+
+function resetTokensCollection(db) {
+  return db.collection('passwordResets');
 }
 
 function serializePost(post) {
@@ -61,6 +86,15 @@ function serializePost(post) {
 function serializeInquiry(inquiry) {
   if (!inquiry) return inquiry;
   const { _id, ...rest } = inquiry;
+  return {
+    ...rest,
+    id: rest.id || _id?.toString()
+  };
+}
+
+function serializeLead(lead) {
+  if (!lead) return lead;
+  const { _id, ...rest } = lead;
   return {
     ...rest,
     id: rest.id || _id?.toString()
@@ -95,6 +129,13 @@ function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   };
 }
 
+async function sendMail({ to, subject, text, html }) {
+  if (!mailer) {
+    throw new Error('SMTP is not configured. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS and MAIL_FROM in Railway variables.');
+  }
+  return mailer.sendMail({ from: mailFrom, to, subject, text, html });
+}
+
 function normalizePost(post) {
   const now = new Date().toISOString().slice(0, 10);
   return {
@@ -122,6 +163,27 @@ function normalizePost(post) {
     scheduledAt: post.scheduledAt || '',
     readingTime: post.readingTime || '',
     updatedAt: new Date()
+  };
+}
+
+function normalizeLead(body = {}) {
+  const now = new Date();
+  return {
+    id: new ObjectId().toString(),
+    company: String(body.company || '').trim(),
+    contactName: String(body.contactName || '').trim(),
+    email: String(body.email || '').trim().toLowerCase(),
+    phone: String(body.phone || '').trim(),
+    website: String(body.website || '').trim(),
+    location: String(body.location || '').trim(),
+    serviceInterest: String(body.serviceInterest || '').trim(),
+    source: String(body.source || '').trim(),
+    status: String(body.status || 'New').trim(),
+    remarks: String(body.remarks || '').trim(),
+    emailCount: 0,
+    lastEmailAt: null,
+    createdAt: now,
+    updatedAt: now
   };
 }
 
@@ -195,6 +257,19 @@ function verifyPassword(password) {
   return verifyPasswordHash(password, adminPasswordSalt, adminPasswordHash);
 }
 
+async function verifySuperAdminPassword(password) {
+  try {
+    const db = await getDb();
+    const override = await authCollection(db).findOne({ key: 'superAdminPassword' });
+    if (override?.passwordSalt && override?.passwordHash) {
+      return verifyPasswordHash(password, override.passwordSalt, override.passwordHash);
+    }
+  } catch {
+    return verifyPassword(password);
+  }
+  return verifyPassword(password);
+}
+
 function verifyPasswordHash(password, salt, expectedHash) {
   if (!salt || !expectedHash || typeof password !== 'string') return false;
   const hash = crypto.pbkdf2Sync(password, salt, 120000, 32, 'sha256').toString('hex');
@@ -260,7 +335,7 @@ app.post('/api/auth/login', (request, response) => {
   }
 
   const login = async () => {
-    if (email === adminEmail && verifyPassword(password)) {
+    if (email === adminEmail && await verifySuperAdminPassword(password)) {
       return superAdminUser();
     }
 
@@ -295,6 +370,89 @@ app.post('/api/auth/login', (request, response) => {
     .catch((error) => {
       response.status(500).json({ message: error.message });
     });
+});
+
+app.post('/api/auth/request-reset', async (request, response) => {
+  try {
+    const email = String(request.body?.email || '').trim().toLowerCase();
+    if (!email) {
+      response.status(400).json({ message: 'Email is required.' });
+      return;
+    }
+
+    const db = await getDb();
+    const isSuperAdmin = email === adminEmail;
+    const user = isSuperAdmin ? superAdminUser() : await usersCollection(db).findOne({ email, status: 'Active' });
+
+    if (user) {
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      await resetTokensCollection(db).insertOne({
+        tokenHash,
+        email,
+        userId: user.id,
+        isSuperAdmin,
+        used: false,
+        expiresAt: new Date(Date.now() + 1000 * 60 * 30),
+        createdAt: new Date()
+      });
+
+      const resetUrl = `${frontendUrl.replace(/\/$/, '')}/admin-reset?token=${token}`;
+      await sendMail({
+        to: email,
+        subject: 'Reset your Kritech CMS password',
+        text: `Reset your Kritech CMS password using this link: ${resetUrl}\n\nThis link expires in 30 minutes.`,
+        html: `<p>Reset your Kritech CMS password using this link:</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>This link expires in 30 minutes.</p>`
+      });
+    }
+
+    response.json({ ok: true, message: 'If the email exists, a reset link has been sent.' });
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.post('/api/auth/reset-password', async (request, response) => {
+  try {
+    const token = String(request.body?.token || '').trim();
+    const password = String(request.body?.password || '');
+    if (!token || password.length < 8) {
+      response.status(400).json({ message: 'Reset token and a password of at least 8 characters are required.' });
+      return;
+    }
+
+    const db = await getDb();
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const reset = await resetTokensCollection(db).findOne({
+      tokenHash,
+      used: false,
+      expiresAt: { $gt: new Date() }
+    });
+
+    if (!reset) {
+      response.status(400).json({ message: 'Reset link is invalid or expired.' });
+      return;
+    }
+
+    const { salt, hash } = hashPassword(password);
+    if (reset.isSuperAdmin) {
+      await authCollection(db).updateOne(
+        { key: 'superAdminPassword' },
+        { $set: { key: 'superAdminPassword', passwordSalt: salt, passwordHash: hash, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } },
+        { upsert: true }
+      );
+    } else {
+      await usersCollection(db).updateOne(
+        { email: reset.email },
+        { $set: { passwordSalt: salt, passwordHash: hash, updatedAt: new Date() } }
+      );
+    }
+
+    await resetTokensCollection(db).updateOne({ _id: reset._id }, { $set: { used: true, usedAt: new Date() } });
+    response.json({ ok: true, message: 'Password reset successful. You can login now.' });
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
 });
 
 app.get('/api/auth/me', requireAdmin, (request, response) => {
@@ -428,6 +586,119 @@ app.delete('/api/inquiries/:id', requireAdmin, requirePermission('inquiries'), a
     const db = await getDb();
     await inquiriesCollection(db).deleteOne({ id: request.params.id });
     response.json({ ok: true });
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.get('/api/leads', requireAdmin, requirePermission('leads'), async (_request, response) => {
+  try {
+    const db = await getDb();
+    const leads = await leadsCollection(db).find({}).sort({ updatedAt: -1, createdAt: -1 }).toArray();
+    response.json(leads.map(serializeLead));
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.post('/api/leads', requireAdmin, requirePermission('leads'), async (request, response) => {
+  try {
+    const lead = normalizeLead(request.body);
+    if (!lead.company || !lead.email) {
+      response.status(400).json({ message: 'Company name and email are required.' });
+      return;
+    }
+
+    const db = await getDb();
+    const existing = await leadsCollection(db).findOne({ email: lead.email });
+    if (existing) {
+      response.status(409).json({ message: 'A lead with this email already exists.' });
+      return;
+    }
+
+    await leadsCollection(db).insertOne(lead);
+    response.status(201).json(serializeLead(lead));
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.patch('/api/leads/:id', requireAdmin, requirePermission('leads'), async (request, response) => {
+  try {
+    const allowed = ['company', 'contactName', 'email', 'phone', 'website', 'location', 'serviceInterest', 'source', 'status', 'remarks'];
+    const patch = {};
+    for (const key of allowed) {
+      if (typeof request.body[key] === 'string') {
+        patch[key] = key === 'email' ? request.body[key].trim().toLowerCase() : request.body[key].trim();
+      }
+    }
+    patch.updatedAt = new Date();
+
+    const db = await getDb();
+    const result = await leadsCollection(db).findOneAndUpdate(
+      { id: request.params.id },
+      { $set: patch },
+      { returnDocument: 'after' }
+    );
+
+    if (!result) {
+      response.status(404).json({ message: 'Lead not found.' });
+      return;
+    }
+
+    response.json(serializeLead(result));
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.delete('/api/leads/:id', requireAdmin, requirePermission('leads'), async (request, response) => {
+  try {
+    const db = await getDb();
+    await leadsCollection(db).deleteOne({ id: request.params.id });
+    response.json({ ok: true });
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.post('/api/leads/bulk-email', requireAdmin, requirePermission('leads'), async (request, response) => {
+  try {
+    const leadIds = Array.isArray(request.body.leadIds) ? request.body.leadIds : [];
+    const subject = String(request.body.subject || '').trim();
+    const message = String(request.body.message || '').trim();
+
+    if (!leadIds.length || !subject || !message) {
+      response.status(400).json({ message: 'Select leads and provide email subject and message.' });
+      return;
+    }
+
+    const db = await getDb();
+    const leads = await leadsCollection(db).find({ id: { $in: leadIds } }).toArray();
+    const sendable = leads.filter((lead) => lead.email);
+    const sentAt = new Date();
+    const results = [];
+
+    for (const lead of sendable) {
+      const personalized = message
+        .replaceAll('{{company}}', lead.company || '')
+        .replaceAll('{{name}}', lead.contactName || lead.company || '');
+      await sendMail({
+        to: lead.email,
+        subject,
+        text: personalized
+      });
+      results.push({ id: lead.id, email: lead.email, ok: true });
+    }
+
+    if (sendable.length) {
+      await leadsCollection(db).updateMany(
+        { id: { $in: sendable.map((lead) => lead.id) } },
+        { $set: { lastEmailAt: sentAt, updatedAt: sentAt }, $inc: { emailCount: 1 } }
+      );
+    }
+
+    response.json({ ok: true, sent: results.length, results });
   } catch (error) {
     response.status(500).json({ message: error.message });
   }
