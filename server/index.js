@@ -29,6 +29,12 @@ const smtpConfig = {
   auth: process.env.SMTP_USER && process.env.SMTP_PASS ? {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS
+  } : undefined,
+  connectionTimeout: Number(process.env.SMTP_CONNECTION_TIMEOUT || 15000),
+  greetingTimeout: Number(process.env.SMTP_GREETING_TIMEOUT || 10000),
+  socketTimeout: Number(process.env.SMTP_SOCKET_TIMEOUT || 20000),
+  tls: process.env.SMTP_HOST ? {
+    servername: process.env.SMTP_HOST
   } : undefined
 };
 const accessModules = ['posts', 'inquiries', 'leads', 'seo', 'sitemap', 'users'];
@@ -678,27 +684,42 @@ app.post('/api/leads/bulk-email', requireAdmin, requirePermission('leads'), asyn
     const sendable = leads.filter((lead) => lead.email);
     const sentAt = new Date();
     const results = [];
+    const failures = [];
 
     for (const lead of sendable) {
       const personalized = message
         .replaceAll('{{company}}', lead.company || '')
         .replaceAll('{{name}}', lead.contactName || lead.company || '');
-      await sendMail({
-        to: lead.email,
-        subject,
-        text: personalized
-      });
-      results.push({ id: lead.id, email: lead.email, ok: true });
+      try {
+        await sendMail({
+          to: lead.email,
+          subject,
+          text: personalized
+        });
+        results.push({ id: lead.id, email: lead.email, ok: true });
+      } catch (error) {
+        failures.push({ id: lead.id, email: lead.email, ok: false, message: error.message });
+      }
     }
 
-    if (sendable.length) {
+    if (results.length) {
       await leadsCollection(db).updateMany(
-        { id: { $in: sendable.map((lead) => lead.id) } },
+        { id: { $in: results.map((lead) => lead.id) } },
         { $set: { lastEmailAt: sentAt, updatedAt: sentAt }, $inc: { emailCount: 1 } }
       );
     }
 
-    response.json({ ok: true, sent: results.length, results });
+    if (!results.length && failures.length) {
+      response.status(502).json({
+        message: `No emails were sent. ${failures[0].message}`,
+        sent: 0,
+        failed: failures.length,
+        failures
+      });
+      return;
+    }
+
+    response.json({ ok: true, sent: results.length, failed: failures.length, results, failures });
   } catch (error) {
     response.status(500).json({ message: error.message });
   }
