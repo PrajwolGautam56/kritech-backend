@@ -4,16 +4,18 @@ import { MongoClient } from 'mongodb';
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.MONGODB_DB_NAME || 'kritech_solution';
 
-if (!uri) {
-  throw new Error('Missing MONGODB_URI. Add it to .env or your Railway environment variables.');
-}
-
-const client = new MongoClient(uri, {
-  serverSelectionTimeoutMS: 10000
-});
+const client = uri
+  ? new MongoClient(uri, {
+      serverSelectionTimeoutMS: 10000
+    })
+  : null;
 let connectionPromise;
 
 export async function getDb() {
+  if (!client) {
+    throw new Error('Missing MONGODB_URI. Add it to .env or your Railway environment variables.');
+  }
+
   if (!connectionPromise) {
     connectionPromise = client.connect();
   }
