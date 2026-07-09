@@ -7,7 +7,10 @@ import { getDb, pingDb } from './mongo.js';
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
-const clientOrigin = process.env.CLIENT_ORIGIN || 'http://127.0.0.1:5173';
+const clientOrigins = (process.env.CLIENT_ORIGIN || 'http://127.0.0.1:5173')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 const cloudinaryCloudName = process.env.CLOUDINARY_CLOUD_NAME;
 const cloudinaryApiKey = process.env.CLOUDINARY_API_KEY;
 const cloudinaryApiSecret = process.env.CLOUDINARY_API_SECRET;
@@ -17,7 +20,16 @@ const adminPasswordSalt = process.env.ADMIN_PASSWORD_SALT;
 const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
 const adminTokenSecret = process.env.ADMIN_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
 
-app.use(cors({ origin: clientOrigin, credentials: true }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || clientOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error(`Origin not allowed by CORS: ${origin}`));
+  },
+  credentials: true
+}));
 app.use(express.json({ limit: '4mb' }));
 
 function postsCollection(db) {
