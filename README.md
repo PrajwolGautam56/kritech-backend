@@ -56,5 +56,9 @@ https://kritechsolution.com
 - `GET /api/inquiries`
 - `PATCH /api/inquiries/:id`
 - `DELETE /api/inquiries/:id`
+- `GET /api/users`
+- `POST /api/users`
+- `PATCH /api/users/:id`
+- `DELETE /api/users/:id`
 - `GET /api/posts`
 - `GET /api/posts/:slug`

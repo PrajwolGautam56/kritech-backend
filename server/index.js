@@ -19,6 +19,7 @@ const adminEmail = process.env.ADMIN_EMAIL;
 const adminPasswordSalt = process.env.ADMIN_PASSWORD_SALT;
 const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
 const adminTokenSecret = process.env.ADMIN_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
+const accessModules = ['posts', 'inquiries', 'seo', 'sitemap', 'users'];
 
 app.use(cors({
   origin(origin, callback) {
@@ -44,6 +45,10 @@ function inquiriesCollection(db) {
   return db.collection('inquiries');
 }
 
+function usersCollection(db) {
+  return db.collection('users');
+}
+
 function serializePost(post) {
   if (!post) return post;
   const { _id, ...rest } = post;
@@ -59,6 +64,34 @@ function serializeInquiry(inquiry) {
   return {
     ...rest,
     id: rest.id || _id?.toString()
+  };
+}
+
+function serializeUser(user) {
+  if (!user) return user;
+  const { _id, passwordHash, passwordSalt, ...rest } = user;
+  return {
+    ...rest,
+    id: rest.id || _id?.toString()
+  };
+}
+
+function superAdminUser() {
+  return {
+    id: 'env-super-admin',
+    name: 'Prajwol Gautam',
+    email: adminEmail,
+    role: 'Super Admin',
+    status: 'Active',
+    permissions: accessModules,
+    systemUser: true
+  };
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  return {
+    salt,
+    hash: crypto.pbkdf2Sync(password, salt, 120000, 32, 'sha256').toString('hex')
   };
 }
 
@@ -159,20 +192,56 @@ function verifyToken(token) {
 
 function verifyPassword(password) {
   if (!adminPasswordSalt || !adminPasswordHash || typeof password !== 'string') return false;
-  const hash = crypto.pbkdf2Sync(password, adminPasswordSalt, 120000, 32, 'sha256').toString('hex');
-  if (Buffer.byteLength(hash) !== Buffer.byteLength(adminPasswordHash)) return false;
-  return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(adminPasswordHash));
+  return verifyPasswordHash(password, adminPasswordSalt, adminPasswordHash);
+}
+
+function verifyPasswordHash(password, salt, expectedHash) {
+  if (!salt || !expectedHash || typeof password !== 'string') return false;
+  const hash = crypto.pbkdf2Sync(password, salt, 120000, 32, 'sha256').toString('hex');
+  if (Buffer.byteLength(hash) !== Buffer.byteLength(expectedHash)) return false;
+  return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(expectedHash));
 }
 
 function requireAdmin(request, response, next) {
   const token = request.headers.authorization?.replace(/^Bearer\s+/i, '');
   const session = verifyToken(token);
-  if (!session || session.email !== adminEmail) {
+  if (!session || !session.email) {
     response.status(401).json({ message: 'Admin login required.' });
     return;
   }
   request.admin = session;
   next();
+}
+
+function requireSuperAdmin(request, response, next) {
+  if (request.admin?.role !== 'Super Admin') {
+    response.status(403).json({ message: 'Super Admin access required.' });
+    return;
+  }
+  next();
+}
+
+function requirePermission(permission) {
+  return (request, response, next) => {
+    if (request.admin?.role === 'Super Admin' || request.admin?.permissions?.includes(permission)) {
+      next();
+      return;
+    }
+    response.status(403).json({ message: `You do not have ${permission} access.` });
+  };
+}
+
+function requireAnyPermission(permissions) {
+  return (request, response, next) => {
+    if (
+      request.admin?.role === 'Super Admin'
+      || permissions.some((permission) => request.admin?.permissions?.includes(permission))
+    ) {
+      next();
+      return;
+    }
+    response.status(403).json({ message: 'You do not have access to update this content.' });
+  };
 }
 
 app.get('/api/health', async (_request, response) => {
@@ -190,24 +259,49 @@ app.post('/api/auth/login', (request, response) => {
     return;
   }
 
-  if (email !== adminEmail || !verifyPassword(password)) {
-    response.status(401).json({ message: 'Invalid email or password.' });
-    return;
-  }
+  const login = async () => {
+    if (email === adminEmail && verifyPassword(password)) {
+      return superAdminUser();
+    }
 
-  const expiresAt = Math.floor(Date.now() / 1000) + (60 * 60 * 12);
-  response.json({
-    token: signToken({ email: adminEmail, role: 'admin', exp: expiresAt }),
-    admin: { email: adminEmail, role: 'admin' },
-    expiresAt
-  });
+    const db = await getDb();
+    const user = await usersCollection(db).findOne({ email });
+    if (!user || user.status !== 'Active' || !verifyPasswordHash(password, user.passwordSalt, user.passwordHash)) {
+      return null;
+    }
+    return serializeUser(user);
+  };
+
+  login()
+    .then((admin) => {
+      if (!admin) {
+        response.status(401).json({ message: 'Invalid email or password.' });
+        return;
+      }
+
+      const expiresAt = Math.floor(Date.now() / 1000) + (60 * 60 * 12);
+      response.json({
+        token: signToken({
+          id: admin.id,
+          email: admin.email,
+          role: admin.role,
+          permissions: admin.permissions || [],
+          exp: expiresAt
+        }),
+        admin,
+        expiresAt
+      });
+    })
+    .catch((error) => {
+      response.status(500).json({ message: error.message });
+    });
 });
 
 app.get('/api/auth/me', requireAdmin, (request, response) => {
-  response.json({ admin: { email: request.admin.email, role: request.admin.role } });
+  response.json({ admin: request.admin });
 });
 
-app.post('/api/cloudinary/signature', requireAdmin, (_request, response) => {
+app.post('/api/cloudinary/signature', requireAdmin, requirePermission('posts'), (_request, response) => {
   if (!cloudinaryCloudName || !cloudinaryApiKey || !cloudinaryApiSecret) {
     response.status(500).json({ message: 'Cloudinary environment variables are missing.' });
     return;
@@ -244,7 +338,7 @@ app.get('/api/content', async (_request, response) => {
   }
 });
 
-app.put('/api/content', requireAdmin, async (request, response) => {
+app.put('/api/content', requireAdmin, requireAnyPermission(['posts', 'seo']), async (request, response) => {
   try {
     const db = await getDb();
     const posts = Array.isArray(request.body.posts) ? request.body.posts.map(normalizePost) : [];
@@ -294,7 +388,7 @@ app.post('/api/inquiries', async (request, response) => {
   }
 });
 
-app.get('/api/inquiries', requireAdmin, async (_request, response) => {
+app.get('/api/inquiries', requireAdmin, requirePermission('inquiries'), async (_request, response) => {
   try {
     const db = await getDb();
     const inquiries = await inquiriesCollection(db).find({}).sort({ createdAt: -1 }).toArray();
@@ -304,7 +398,7 @@ app.get('/api/inquiries', requireAdmin, async (_request, response) => {
   }
 });
 
-app.patch('/api/inquiries/:id', requireAdmin, async (request, response) => {
+app.patch('/api/inquiries/:id', requireAdmin, requirePermission('inquiries'), async (request, response) => {
   try {
     const patch = {};
     if (typeof request.body.status === 'string') patch.status = request.body.status;
@@ -329,10 +423,118 @@ app.patch('/api/inquiries/:id', requireAdmin, async (request, response) => {
   }
 });
 
-app.delete('/api/inquiries/:id', requireAdmin, async (request, response) => {
+app.delete('/api/inquiries/:id', requireAdmin, requirePermission('inquiries'), async (request, response) => {
   try {
     const db = await getDb();
     await inquiriesCollection(db).deleteOne({ id: request.params.id });
+    response.json({ ok: true });
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.get('/api/users', requireAdmin, requireSuperAdmin, async (_request, response) => {
+  try {
+    const db = await getDb();
+    const users = await usersCollection(db).find({}).sort({ createdAt: -1 }).toArray();
+    response.json([superAdminUser(), ...users.map(serializeUser)]);
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.post('/api/users', requireAdmin, requireSuperAdmin, async (request, response) => {
+  try {
+    const { name, email, password, role, status, permissions } = request.body || {};
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanPassword = String(password || '');
+
+    if (!cleanEmail || !cleanPassword) {
+      response.status(400).json({ message: 'Email and password are required.' });
+      return;
+    }
+    if (cleanEmail === adminEmail) {
+      response.status(400).json({ message: 'The Super Admin user is managed from environment variables.' });
+      return;
+    }
+
+    const db = await getDb();
+    const existing = await usersCollection(db).findOne({ email: cleanEmail });
+    if (existing) {
+      response.status(409).json({ message: 'A user with this email already exists.' });
+      return;
+    }
+
+    const { salt, hash } = hashPassword(cleanPassword);
+    const now = new Date();
+    const user = {
+      id: new ObjectId().toString(),
+      name: String(name || cleanEmail).trim(),
+      email: cleanEmail,
+      role: role || 'Editor',
+      status: status || 'Active',
+      permissions: Array.isArray(permissions) ? permissions.filter((item) => accessModules.includes(item)) : ['posts'],
+      passwordSalt: salt,
+      passwordHash: hash,
+      createdAt: now,
+      updatedAt: now
+    };
+
+    await usersCollection(db).insertOne(user);
+    response.status(201).json(serializeUser(user));
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.patch('/api/users/:id', requireAdmin, requireSuperAdmin, async (request, response) => {
+  try {
+    if (request.params.id === 'env-super-admin') {
+      response.status(400).json({ message: 'The Super Admin user is managed from environment variables.' });
+      return;
+    }
+
+    const patch = {};
+    if (typeof request.body.name === 'string') patch.name = request.body.name.trim();
+    if (typeof request.body.role === 'string') patch.role = request.body.role;
+    if (typeof request.body.status === 'string') patch.status = request.body.status;
+    if (Array.isArray(request.body.permissions)) {
+      patch.permissions = request.body.permissions.filter((item) => accessModules.includes(item));
+    }
+    if (typeof request.body.password === 'string' && request.body.password.trim()) {
+      const { salt, hash } = hashPassword(request.body.password.trim());
+      patch.passwordSalt = salt;
+      patch.passwordHash = hash;
+    }
+    patch.updatedAt = new Date();
+
+    const db = await getDb();
+    const result = await usersCollection(db).findOneAndUpdate(
+      { id: request.params.id },
+      { $set: patch },
+      { returnDocument: 'after' }
+    );
+
+    if (!result) {
+      response.status(404).json({ message: 'User not found.' });
+      return;
+    }
+
+    response.json(serializeUser(result));
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.delete('/api/users/:id', requireAdmin, requireSuperAdmin, async (request, response) => {
+  try {
+    if (request.params.id === 'env-super-admin') {
+      response.status(400).json({ message: 'The Super Admin cannot be deleted.' });
+      return;
+    }
+
+    const db = await getDb();
+    await usersCollection(db).deleteOne({ id: request.params.id });
     response.json({ ok: true });
   } catch (error) {
     response.status(500).json({ message: error.message });
