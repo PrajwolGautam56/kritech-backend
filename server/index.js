@@ -40,9 +40,22 @@ function seoCollection(db) {
   return db.collection('seo');
 }
 
+function inquiriesCollection(db) {
+  return db.collection('inquiries');
+}
+
 function serializePost(post) {
   if (!post) return post;
   const { _id, ...rest } = post;
+  return {
+    ...rest,
+    id: rest.id || _id?.toString()
+  };
+}
+
+function serializeInquiry(inquiry) {
+  if (!inquiry) return inquiry;
+  const { _id, ...rest } = inquiry;
   return {
     ...rest,
     id: rest.id || _id?.toString()
@@ -76,6 +89,25 @@ function normalizePost(post) {
     scheduledAt: post.scheduledAt || '',
     readingTime: post.readingTime || '',
     updatedAt: new Date()
+  };
+}
+
+function normalizeInquiry(body = {}, request) {
+  const now = new Date();
+  return {
+    id: new ObjectId().toString(),
+    name: String(body.name || '').trim(),
+    contact: String(body.contact || '').trim(),
+    service: String(body.service || '').trim(),
+    location: String(body.location || '').trim(),
+    message: String(body.message || '').trim(),
+    sourcePage: String(body.sourcePage || '').trim(),
+    status: 'New',
+    note: '',
+    userAgent: request.headers['user-agent'] || '',
+    ip: request.headers['x-forwarded-for']?.split(',')[0]?.trim() || request.socket.remoteAddress || '',
+    createdAt: now,
+    updatedAt: now
   };
 }
 
@@ -237,6 +269,71 @@ app.put('/api/content', requireAdmin, async (request, response) => {
     );
 
     response.json({ ok: true, postsSaved: posts.length });
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.post('/api/inquiries', async (request, response) => {
+  try {
+    const inquiry = normalizeInquiry(request.body, request);
+
+    if (!inquiry.name || !inquiry.contact || !inquiry.message) {
+      response.status(400).json({ message: 'Please provide your name, phone/email and project message.' });
+      return;
+    }
+
+    const db = await getDb();
+    await inquiriesCollection(db).insertOne(inquiry);
+    response.status(201).json({
+      ok: true,
+      inquiry: serializeInquiry(inquiry)
+    });
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.get('/api/inquiries', requireAdmin, async (_request, response) => {
+  try {
+    const db = await getDb();
+    const inquiries = await inquiriesCollection(db).find({}).sort({ createdAt: -1 }).toArray();
+    response.json(inquiries.map(serializeInquiry));
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.patch('/api/inquiries/:id', requireAdmin, async (request, response) => {
+  try {
+    const patch = {};
+    if (typeof request.body.status === 'string') patch.status = request.body.status;
+    if (typeof request.body.note === 'string') patch.note = request.body.note;
+    patch.updatedAt = new Date();
+
+    const db = await getDb();
+    const result = await inquiriesCollection(db).findOneAndUpdate(
+      { id: request.params.id },
+      { $set: patch },
+      { returnDocument: 'after' }
+    );
+
+    if (!result) {
+      response.status(404).json({ message: 'Inquiry not found.' });
+      return;
+    }
+
+    response.json(serializeInquiry(result));
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.delete('/api/inquiries/:id', requireAdmin, async (request, response) => {
+  try {
+    const db = await getDb();
+    await inquiriesCollection(db).deleteOne({ id: request.params.id });
+    response.json({ ok: true });
   } catch (error) {
     response.status(500).json({ message: error.message });
   }

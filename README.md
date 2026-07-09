@@ -52,5 +52,9 @@ https://kritechsolution.com
 - `GET /api/content`
 - `PUT /api/content`
 - `POST /api/cloudinary/signature`
+- `POST /api/inquiries`
+- `GET /api/inquiries`
+- `PATCH /api/inquiries/:id`
+- `DELETE /api/inquiries/:id`
 - `GET /api/posts`
 - `GET /api/posts/:slug`
