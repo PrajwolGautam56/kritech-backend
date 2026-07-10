@@ -26,11 +26,6 @@ Required production variables:
 - `CLOUDINARY_API_KEY`
 - `CLOUDINARY_API_SECRET`
 - `CLOUDINARY_UPLOAD_FOLDER`
-- `SMTP_HOST`
-- `SMTP_PORT`
-- `SMTP_SECURE`
-- `SMTP_USER`
-- `SMTP_PASS`
 - `MAIL_FROM`
 - `ADMIN_EMAIL`
 - `ADMIN_PASSWORD_SALT`
@@ -51,7 +46,9 @@ Set `CLIENT_ORIGIN` to the deployed frontend domain, for example:
 https://kritechsolution.com
 ```
 
-Set `FRONTEND_URL` to the same public site URL so password reset emails generate the correct `/admin-reset` link. SMTP variables are required for lead bulk email and password reset email delivery.
+Set `FRONTEND_URL` to the same public site URL so password reset emails generate the correct `/admin-reset` link.
+
+For reliable production mail, set `MAIL_PROVIDER=auto` and add either `RESEND_API_KEY` or `BREVO_API_KEY`. SMTP variables can stay as a fallback, but API mail avoids Railway-to-SMTP connection timeouts.
 
 ## Endpoints
 

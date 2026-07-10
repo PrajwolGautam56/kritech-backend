@@ -22,6 +22,9 @@ const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
 const adminTokenSecret = process.env.ADMIN_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
 const frontendUrl = process.env.FRONTEND_URL || clientOrigins[0] || 'http://127.0.0.1:5173';
 const mailFrom = process.env.MAIL_FROM || process.env.SMTP_USER || 'Kritech Solution <no-reply@kritechsolution.com>';
+const mailProvider = String(process.env.MAIL_PROVIDER || 'auto').trim().toLowerCase();
+const resendApiKey = process.env.RESEND_API_KEY;
+const brevoApiKey = process.env.BREVO_API_KEY;
 const smtpConfig = {
   host: process.env.SMTP_HOST,
   port: Number(process.env.SMTP_PORT || 587),
@@ -135,11 +138,101 @@ function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   };
 }
 
-async function sendMail({ to, subject, text, html }) {
-  if (!mailer) {
-    throw new Error('SMTP is not configured. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS and MAIL_FROM in Railway variables.');
+function mailProviderName() {
+  if ((mailProvider === 'resend' || mailProvider === 'auto') && resendApiKey) return 'resend';
+  if ((mailProvider === 'brevo' || mailProvider === 'auto') && brevoApiKey) return 'brevo';
+  if ((mailProvider === 'smtp' || mailProvider === 'auto') && mailer) return 'smtp';
+  return mailProvider === 'auto' ? 'none' : mailProvider;
+}
+
+function splitEmailAddress(value = '') {
+  const match = String(value).match(/^\s*(.*?)\s*<([^>]+)>\s*$/);
+  if (match) {
+    return {
+      name: match[1].replace(/^"|"$/g, '').trim(),
+      email: match[2].trim()
+    };
   }
-  return mailer.sendMail({ from: mailFrom, to, subject, text, html });
+  return {
+    name: 'Kritech Solution',
+    email: String(value || process.env.SMTP_USER || adminEmail || '').trim()
+  };
+}
+
+async function fetchJsonWithTimeout(url, options, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const text = await response.text();
+    let data = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { message: text };
+      }
+    }
+    if (!response.ok) {
+      throw new Error(data?.message || data?.error || `Mail API returned HTTP ${response.status}.`);
+    }
+    return data;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('Mail API request timed out.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function sendMail({ to, subject, text, html }) {
+  const provider = mailProviderName();
+  const recipients = Array.isArray(to) ? to : [to];
+  const htmlBody = html || `<p>${String(text || '').replace(/\n/g, '<br>')}</p>`;
+
+  if (provider === 'resend') {
+    return fetchJsonWithTimeout('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${resendApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: mailFrom,
+        to: recipients,
+        subject,
+        html: htmlBody,
+        text
+      })
+    });
+  }
+
+  if (provider === 'brevo') {
+    const sender = splitEmailAddress(mailFrom);
+    return fetchJsonWithTimeout('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'api-key': brevoApiKey,
+        'Content-Type': 'application/json',
+        Accept: 'application/json'
+      },
+      body: JSON.stringify({
+        sender,
+        to: recipients.map((email) => ({ email })),
+        subject,
+        htmlContent: htmlBody,
+        textContent: text
+      })
+    });
+  }
+
+  if (provider === 'smtp' && mailer) {
+    return mailer.sendMail({ from: mailFrom, to, subject, text, html });
+  }
+
+  throw new Error('Mail is not configured. Add RESEND_API_KEY or BREVO_API_KEY, or configure SMTP variables in Railway.');
 }
 
 function normalizePost(post) {
@@ -726,8 +819,16 @@ app.post('/api/leads/bulk-email', requireAdmin, requirePermission('leads'), asyn
 });
 
 app.get('/api/mail/status', requireAdmin, requirePermission('mail'), (_request, response) => {
+  const provider = mailProviderName();
   response.json({
-    configured: Boolean(mailer && smtpConfig.host && smtpConfig.auth),
+    configured: provider !== 'none'
+      && (provider !== 'smtp' || Boolean(mailer && smtpConfig.host && smtpConfig.auth)),
+    provider,
+    requestedProvider: mailProvider,
+    apiProviders: {
+      resend: Boolean(resendApiKey),
+      brevo: Boolean(brevoApiKey)
+    },
     host: smtpConfig.host || '',
     port: smtpConfig.port,
     secure: smtpConfig.secure,
