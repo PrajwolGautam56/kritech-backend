@@ -20,6 +20,7 @@ Required production variables:
 - `MONGODB_URI`
 - `MONGODB_DB_NAME`
 - `PORT`
+- `JSON_BODY_LIMIT` (recommended: `25mb`)
 - `CLIENT_ORIGIN`
 - `FRONTEND_URL`
 - `CLOUDINARY_CLOUD_NAME`
@@ -31,6 +32,8 @@ Required production variables:
 - `ADMIN_PASSWORD_SALT`
 - `ADMIN_PASSWORD_HASH`
 - `ADMIN_TOKEN_SECRET`
+
+Set `ADMIN_TOKEN_SECRET` to a long random value and keep it unchanged. If this value changes, existing admin sessions expire and the dashboard will ask you to login again.
 
 ## Railway
 

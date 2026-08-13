@@ -19,7 +19,9 @@ const cloudinaryUploadFolder = process.env.CLOUDINARY_UPLOAD_FOLDER || 'kritech/
 const adminEmail = process.env.ADMIN_EMAIL;
 const adminPasswordSalt = process.env.ADMIN_PASSWORD_SALT;
 const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
-const adminTokenSecret = process.env.ADMIN_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
+const adminTokenSecret = process.env.ADMIN_TOKEN_SECRET
+  || [adminEmail, adminPasswordSalt, adminPasswordHash].filter(Boolean).join(':')
+  || crypto.randomBytes(32).toString('hex');
 const frontendUrl = process.env.FRONTEND_URL || clientOrigins[0] || 'http://127.0.0.1:5173';
 const mailFrom = process.env.MAIL_FROM || process.env.SMTP_USER || 'Kritech Solution <no-reply@kritechsolution.com>';
 const mailProvider = String(process.env.MAIL_PROVIDER || 'auto').trim().toLowerCase();
@@ -53,7 +55,7 @@ app.use(cors({
   },
   credentials: true
 }));
-app.use(express.json({ limit: '4mb' }));
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '25mb' }));
 
 function postsCollection(db) {
   return db.collection('posts');
