@@ -7,6 +7,7 @@ const SMS_ROUTE_ID = process.env.SAMAYA_SMS_ROUTE_ID || '10255';
 const SMS_SENDER_ID = process.env.SAMAYA_SMS_SENDER_ID || 'Bit_Alert';
 const SMS_REQUEST_TIMEOUT = Number(process.env.SAMAYA_SMS_TIMEOUT || 15000);
 const SMS_MAX_ATTEMPTS = Number(process.env.SAMAYA_SMS_MAX_ATTEMPTS || 3);
+const SMS_DLR_MAX_ATTEMPTS = Number(process.env.SAMAYA_SMS_DLR_MAX_ATTEMPTS || 10);
 
 let workerRunning = false;
 let workerTimer = null;
@@ -153,9 +154,30 @@ async function updateCampaignAfterDelivery(db, campaignId, status) {
   if (campaign && campaign.processed >= campaign.total) {
     await campaignsCollection(db).updateOne(
       { id: campaignId },
-      { $set: { status: campaign.failed === campaign.total ? 'Failed' : 'Completed', completedAt: new Date(), updatedAt: new Date() } }
+      { $set: { status: campaign.failed === campaign.total ? 'Failed' : 'Tracking', pendingDlr: campaign.submitted || 0, submittedAt: new Date(), updatedAt: new Date() } }
     );
   }
+}
+
+async function refreshCampaignTracking(db, campaignId) {
+  const counts = await deliveriesCollection(db).aggregate([
+    { $match: { campaignId } },
+    { $group: { _id: '$status', count: { $sum: 1 } } }
+  ]).toArray();
+  const byStatus = Object.fromEntries(counts.map((item) => [item._id, item.count]));
+  const delivered = byStatus.delivered || 0;
+  const deliveryFailed = byStatus.delivery_failed || 0;
+  const pendingDlr = (byStatus.submitted || 0) + (byStatus.dlr_checking || 0);
+  const dlrUnavailable = byStatus.dlr_unavailable || 0;
+  const patch = { delivered, deliveryFailed, pendingDlr, dlrUnavailable, updatedAt: new Date() };
+  if (pendingDlr === 0) {
+    patch.status = 'Completed';
+    patch.completedAt = new Date();
+  } else {
+    patch.status = 'Tracking';
+  }
+  await campaignsCollection(db).updateOne({ id: campaignId }, { $set: patch });
+  return patch;
 }
 
 async function processNextDelivery(getDb) {
@@ -176,7 +198,7 @@ async function processNextDelivery(getDb) {
     const result = await submitSms(delivery);
     await deliveriesCollection(db).updateOne(
       { id: delivery.id },
-      { $set: { status: 'submitted', shootId: result.shootId, providerResponse: result.providerResponse, submittedAt: new Date(), lockedAt: null, updatedAt: new Date() } }
+      { $set: { status: 'submitted', shootId: result.shootId, providerResponse: result.providerResponse, submittedAt: new Date(), nextDlrAt: new Date(Date.now() + 120000), dlrAttempts: 0, lockedAt: null, updatedAt: new Date() } }
     );
     await updateCampaignAfterDelivery(db, delivery.campaignId, 'submitted');
   } catch (error) {
@@ -197,6 +219,67 @@ async function processNextDelivery(getDb) {
   return true;
 }
 
+function dlrRetryDelay(attempts) {
+  const delays = [2, 5, 10, 20, 30, 60, 120, 240, 480, 720];
+  return (delays[Math.min(attempts, delays.length - 1)] || 720) * 60000;
+}
+
+async function fetchDeliveryReport(shootId, phone) {
+  const raw = await fetchText(`https://samayasms.com.np/miscapi/${encodeURIComponent(SMS_API_KEY)}/getDLR/${encodeURIComponent(shootId)}`);
+  if (/^\s*ERR:/i.test(raw)) throw new Error(raw.trim());
+  const reports = JSON.parse(raw);
+  const report = Array.isArray(reports) ? reports.find((item) => cleanPhone(item.MSISDN) === phone) || reports[0] : null;
+  if (!report) return { terminal: false, report: null };
+  const statusText = `${report.DLR || ''} ${report.DESC || ''}`;
+  if (/delivered/i.test(report.DLR || '')) return { terminal: true, delivered: true, report };
+  if (/failed|reject|expired|undeliver|invalid|blocked/i.test(statusText)) return { terminal: true, delivered: false, report };
+  return { terminal: false, report };
+}
+
+async function processNextDlr(getDb) {
+  const db = await getDb();
+  const now = new Date();
+  const delivery = await deliveriesCollection(db).findOneAndUpdate(
+    {
+      status: 'submitted',
+      shootId: { $exists: true, $ne: '' },
+      $and: [
+        { $or: [{ nextDlrAt: { $lte: now } }, { nextDlrAt: { $exists: false } }] },
+        { $or: [{ dlrAttempts: { $lt: SMS_DLR_MAX_ATTEMPTS } }, { dlrAttempts: { $exists: false } }] },
+        { $or: [{ dlrLockedAt: null }, { dlrLockedAt: { $exists: false } }, { dlrLockedAt: { $lt: new Date(Date.now() - 120000) } }] }
+      ]
+    },
+    { $set: { status: 'dlr_checking', dlrLockedAt: now, updatedAt: now } },
+    { sort: { nextDlrAt: 1, submittedAt: 1 }, returnDocument: 'after' }
+  );
+  if (!delivery) return false;
+
+  const attempts = Number(delivery.dlrAttempts || 0) + 1;
+  try {
+    const result = await fetchDeliveryReport(delivery.shootId, delivery.phone);
+    if (result.terminal) {
+      await deliveriesCollection(db).updateOne(
+        { id: delivery.id },
+        { $set: { status: result.delivered ? 'delivered' : 'delivery_failed', dlr: result.report, dlrAttempts: attempts, dlrCheckedAt: new Date(), dlrLockedAt: null, updatedAt: new Date() } }
+      );
+    } else {
+      const exhausted = attempts >= SMS_DLR_MAX_ATTEMPTS;
+      await deliveriesCollection(db).updateOne(
+        { id: delivery.id },
+        { $set: { status: exhausted ? 'dlr_unavailable' : 'submitted', dlr: result.report, dlrAttempts: attempts, nextDlrAt: new Date(Date.now() + dlrRetryDelay(attempts)), dlrCheckedAt: new Date(), dlrLockedAt: null, updatedAt: new Date() } }
+      );
+    }
+  } catch (error) {
+    const exhausted = attempts >= SMS_DLR_MAX_ATTEMPTS;
+    await deliveriesCollection(db).updateOne(
+      { id: delivery.id },
+      { $set: { status: exhausted ? 'dlr_unavailable' : 'submitted', dlrAttempts: attempts, dlrError: error.message, nextDlrAt: new Date(Date.now() + dlrRetryDelay(attempts)), dlrCheckedAt: new Date(), dlrLockedAt: null, updatedAt: new Date() } }
+    );
+  }
+  await refreshCampaignTracking(db, delivery.campaignId);
+  return true;
+}
+
 function scheduleWorker(getDb, delayMs = 0) {
   if (workerTimer) clearTimeout(workerTimer);
   workerTimer = setTimeout(() => workerTick(getDb), delayMs);
@@ -210,6 +293,10 @@ async function workerTick(getDb) {
   try {
     for (let index = 0; index < 8; index += 1) {
       if (!await processNextDelivery(getDb)) break;
+      processed += 1;
+    }
+    for (let index = 0; index < 4; index += 1) {
+      if (!await processNextDlr(getDb)) break;
       processed += 1;
     }
   } catch (error) {
@@ -415,6 +502,9 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
         submitted: 0,
         delivered: 0,
         failed: 0,
+        deliveryFailed: 0,
+        pendingDlr: 0,
+        dlrUnavailable: 0,
         scheduledAt: scheduleDate,
         createdBy: request.admin.email,
         createdAt: now,
@@ -453,28 +543,21 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
     try {
       if (!SMS_API_KEY) return response.status(503).json({ message: 'SMS API is not configured.' });
       const db = await getDb();
-      const deliveries = await deliveriesCollection(db).find({ campaignId: request.params.id, status: 'submitted', shootId: { $ne: '' } }).limit(1000).toArray();
+      const deliveries = await deliveriesCollection(db).find({ campaignId: request.params.id, status: { $in: ['submitted', 'dlr_unavailable'] }, shootId: { $ne: '' } }).limit(1000).toArray();
       let delivered = 0;
       let failed = 0;
       for (const delivery of deliveries) {
         try {
-          const raw = await fetchText(`https://samayasms.com.np/miscapi/${encodeURIComponent(SMS_API_KEY)}/getDLR/${encodeURIComponent(delivery.shootId)}`);
-          const reports = JSON.parse(raw);
-          const report = Array.isArray(reports) ? reports.find((item) => cleanPhone(item.MSISDN) === delivery.phone) || reports[0] : null;
-          if (!report) continue;
-          const isDelivered = /delivered/i.test(report.DLR || '');
-          const isFailed = /failed|reject|expired|undeliver/i.test(`${report.DLR || ''} ${report.DESC || ''}`);
-          if (!isDelivered && !isFailed) continue;
-          await deliveriesCollection(db).updateOne({ id: delivery.id }, { $set: { status: isDelivered ? 'delivered' : 'delivery_failed', dlr: report, updatedAt: new Date() } });
-          if (isDelivered) delivered += 1;
-          if (isFailed) failed += 1;
+          const result = await fetchDeliveryReport(delivery.shootId, delivery.phone);
+          if (!result.terminal) continue;
+          await deliveriesCollection(db).updateOne({ id: delivery.id }, { $set: { status: result.delivered ? 'delivered' : 'delivery_failed', dlr: result.report, dlrCheckedAt: new Date(), dlrLockedAt: null, updatedAt: new Date() } });
+          if (result.delivered) delivered += 1;
+          if (!result.delivered) failed += 1;
         } catch {
           // A pending DLR is expected and can be refreshed later.
         }
       }
-      const counts = await deliveriesCollection(db).aggregate([{ $match: { campaignId: request.params.id } }, { $group: { _id: '$status', count: { $sum: 1 } } }]).toArray();
-      const byStatus = Object.fromEntries(counts.map((item) => [item._id, item.count]));
-      await campaignsCollection(db).updateOne({ id: request.params.id }, { $set: { delivered: byStatus.delivered || 0, deliveryFailed: byStatus.delivery_failed || 0, updatedAt: new Date() } });
+      await refreshCampaignTracking(db, request.params.id);
       response.json({ ok: true, delivered, failed });
     } catch (error) {
       response.status(500).json({ message: error.message });
