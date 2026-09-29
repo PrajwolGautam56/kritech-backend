@@ -226,15 +226,17 @@ async function getProviderSummary(force = false) {
   let balance = null;
   let lastTransaction = null;
   let providerError = '';
-  try {
-    const [balanceRaw, transactionRaw] = await Promise.all([
-      fetchText(`https://samayasms.com.np/miscapi/${encodeURIComponent(SMS_API_KEY)}/getBalance/true/`),
-      fetchText(`https://samayasms.com.np/lasttran/index.php?key=${encodeURIComponent(SMS_API_KEY)}`)
-    ]);
-    balance = JSON.parse(balanceRaw);
-    lastTransaction = JSON.parse(transactionRaw);
-  } catch (error) {
-    providerError = error.message;
+  const [balanceResult, transactionResult] = await Promise.allSettled([
+    fetchText(`https://samayasms.com.np/miscapi/${encodeURIComponent(SMS_API_KEY)}/getBalance/true/`),
+    fetchText(`https://samayasms.com.np/lasttran/index.php?key=${encodeURIComponent(SMS_API_KEY)}`)
+  ]);
+  if (balanceResult.status === 'fulfilled') {
+    try { balance = JSON.parse(balanceResult.value); } catch { providerError = 'SamayaSMS returned an invalid balance response.'; }
+  } else {
+    providerError = balanceResult.reason.message;
+  }
+  if (transactionResult.status === 'fulfilled') {
+    try { lastTransaction = JSON.parse(transactionResult.value); } catch { lastTransaction = null; }
   }
   providerSummaryCache = { expiresAt: Date.now() + 120000, balance, lastTransaction, providerError };
   return providerSummaryCache;
