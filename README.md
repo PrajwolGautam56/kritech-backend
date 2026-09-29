@@ -87,6 +87,8 @@ The SMS API key is server-only. Add the SamayaSMS variables to Railway and never
 - `GET /api/posts`
 - `GET /api/posts/:slug`
 - `GET /api/sms/overview`
+- `GET /api/sms/bootstrap`
+- `GET /api/sms/campaign-status`
 - `GET /api/sms/contacts`
 - `POST /api/sms/contacts/import`
 - `DELETE /api/sms/contacts/:id`

@@ -9,6 +9,8 @@ const SMS_REQUEST_TIMEOUT = Number(process.env.SAMAYA_SMS_TIMEOUT || 15000);
 const SMS_MAX_ATTEMPTS = Number(process.env.SAMAYA_SMS_MAX_ATTEMPTS || 3);
 
 let workerRunning = false;
+let workerTimer = null;
+let providerSummaryCache = { expiresAt: 0, balance: null, lastTransaction: null, providerError: '' };
 
 function contactsCollection(db) {
   return db.collection('smsContacts');
@@ -195,18 +197,73 @@ async function processNextDelivery(getDb) {
   return true;
 }
 
+function scheduleWorker(getDb, delayMs = 0) {
+  if (workerTimer) clearTimeout(workerTimer);
+  workerTimer = setTimeout(() => workerTick(getDb), delayMs);
+  workerTimer.unref();
+}
+
 async function workerTick(getDb) {
   if (workerRunning || !SMS_API_KEY) return;
   workerRunning = true;
+  let processed = 0;
   try {
     for (let index = 0; index < 8; index += 1) {
       if (!await processNextDelivery(getDb)) break;
+      processed += 1;
     }
   } catch (error) {
     console.error('SMS worker error:', error.message);
   } finally {
     workerRunning = false;
+    scheduleWorker(getDb, processed ? 750 : 60000);
   }
+}
+
+async function getProviderSummary(force = false) {
+  if (!SMS_API_KEY) return { balance: null, lastTransaction: null, providerError: '' };
+  if (!force && providerSummaryCache.expiresAt > Date.now()) return providerSummaryCache;
+  let balance = null;
+  let lastTransaction = null;
+  let providerError = '';
+  try {
+    const [balanceRaw, transactionRaw] = await Promise.all([
+      fetchText(`https://samayasms.com.np/miscapi/${encodeURIComponent(SMS_API_KEY)}/getBalance/true/`),
+      fetchText(`https://samayasms.com.np/lasttran/index.php?key=${encodeURIComponent(SMS_API_KEY)}`)
+    ]);
+    balance = JSON.parse(balanceRaw);
+    lastTransaction = JSON.parse(transactionRaw);
+  } catch (error) {
+    providerError = error.message;
+  }
+  providerSummaryCache = { expiresAt: Date.now() + 120000, balance, lastTransaction, providerError };
+  return providerSummaryCache;
+}
+
+async function getPortalData(db, forceProvider = false) {
+  const [contactCount, campaignCount, recentCampaigns, contacts, campaigns, provider] = await Promise.all([
+    contactsCollection(db).countDocuments(),
+    campaignsCollection(db).countDocuments(),
+    campaignsCollection(db).find({}).sort({ createdAt: -1 }).limit(8).toArray(),
+    contactsCollection(db).find({}).sort({ updatedAt: -1 }).limit(5000).toArray(),
+    campaignsCollection(db).find({}).sort({ createdAt: -1 }).limit(100).toArray(),
+    getProviderSummary(forceProvider)
+  ]);
+  return {
+    overview: {
+      configured: Boolean(SMS_API_KEY && SMS_SENDER_ID),
+      senderId: SMS_SENDER_ID,
+      routeId: SMS_ROUTE_ID,
+      contactCount,
+      campaignCount,
+      balance: provider.balance,
+      lastTransaction: provider.lastTransaction,
+      providerError: provider.providerError,
+      recentCampaigns: recentCampaigns.map(withoutMongoId)
+    },
+    contacts: contacts.map(withoutMongoId),
+    campaigns: campaigns.map(withoutMongoId)
+  };
 }
 
 export function startSmsWorker(getDb) {
@@ -216,14 +273,13 @@ export function startSmsWorker(getDb) {
     deliveriesCollection(db).createIndex({ status: 1, nextAttemptAt: 1, lockedAt: 1 }),
     deliveriesCollection(db).createIndex({ campaignId: 1, createdAt: -1 })
   ])).catch((error) => console.error('SMS index setup error:', error.message));
-  setInterval(() => workerTick(getDb), 4000).unref();
-  setTimeout(() => workerTick(getDb), 1500).unref();
+  scheduleWorker(getDb, 1500);
 }
 
 export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission }) {
   const protect = [requireAdmin, requirePermission('sms')];
 
-  app.get('/api/sms/overview', ...protect, async (_request, response) => {
+  app.get('/api/sms/overview', ...protect, async (request, response) => {
     try {
       const db = await getDb();
       const [contactCount, campaignCount, recentCampaigns] = await Promise.all([
@@ -231,22 +287,27 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
         campaignsCollection(db).countDocuments(),
         campaignsCollection(db).find({}).sort({ createdAt: -1 }).limit(8).toArray()
       ]);
-      let balance = null;
-      let lastTransaction = null;
-      let providerError = '';
-      if (SMS_API_KEY) {
-        try {
-          const [balanceRaw, transactionRaw] = await Promise.all([
-            fetchText(`https://samayasms.com.np/miscapi/${encodeURIComponent(SMS_API_KEY)}/getBalance/true/`),
-            fetchText(`https://samayasms.com.np/lasttran/index.php?key=${encodeURIComponent(SMS_API_KEY)}`)
-          ]);
-          balance = JSON.parse(balanceRaw);
-          lastTransaction = JSON.parse(transactionRaw);
-        } catch (error) {
-          providerError = error.message;
-        }
-      }
+      const { balance, lastTransaction, providerError } = await getProviderSummary(request.query.refresh === '1');
       response.json({ configured: Boolean(SMS_API_KEY && SMS_SENDER_ID), senderId: SMS_SENDER_ID, routeId: SMS_ROUTE_ID, contactCount, campaignCount, balance, lastTransaction, providerError, recentCampaigns: recentCampaigns.map(withoutMongoId) });
+    } catch (error) {
+      response.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/sms/bootstrap', ...protect, async (request, response) => {
+    try {
+      const db = await getDb();
+      response.json(await getPortalData(db, request.query.refresh === '1'));
+    } catch (error) {
+      response.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get('/api/sms/campaign-status', ...protect, async (_request, response) => {
+    try {
+      const db = await getDb();
+      const campaigns = await campaignsCollection(db).find({}).sort({ createdAt: -1 }).limit(100).toArray();
+      response.json(campaigns.map(withoutMongoId));
     } catch (error) {
       response.status(500).json({ message: error.message });
     }
@@ -380,7 +441,7 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
       await campaignsCollection(db).insertOne(campaign);
       await deliveriesCollection(db).insertMany(deliveries);
       response.status(202).json(withoutMongoId(campaign));
-      setTimeout(() => workerTick(getDb), 25).unref();
+      scheduleWorker(getDb, 25);
     } catch (error) {
       response.status(500).json({ message: error.message });
     }
