@@ -5,6 +5,7 @@ import express from 'express';
 import { ObjectId } from 'mongodb';
 import nodemailer from 'nodemailer';
 import { getDb, pingDb } from './mongo.js';
+import { registerSmsRoutes, startSmsWorker } from './sms.js';
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
@@ -42,7 +43,7 @@ const smtpConfig = {
     servername: process.env.SMTP_HOST
   } : undefined
 };
-const accessModules = ['posts', 'inquiries', 'leads', 'mail', 'seo', 'sitemap', 'users'];
+const accessModules = ['posts', 'inquiries', 'leads', 'mail', 'sms', 'seo', 'sitemap', 'users'];
 const mailer = smtpConfig.host ? nodemailer.createTransport(smtpConfig) : null;
 
 app.use(cors({
@@ -997,6 +998,9 @@ app.get('/api/posts/:slug', async (request, response) => {
     response.status(500).json({ message: error.message });
   }
 });
+
+registerSmsRoutes(app, { getDb, requireAdmin, requirePermission });
+startSmsWorker(getDb);
 
 app.listen(port, () => {
   console.log(`Kritech API running on port ${port}`);

@@ -32,6 +32,10 @@ Required production variables:
 - `ADMIN_PASSWORD_SALT`
 - `ADMIN_PASSWORD_HASH`
 - `ADMIN_TOKEN_SECRET`
+- `SAMAYA_SMS_API_KEY`
+- `SAMAYA_SMS_CAMPAIGN_ID`
+- `SAMAYA_SMS_ROUTE_ID`
+- `SAMAYA_SMS_SENDER_ID`
 
 Set `ADMIN_TOKEN_SECRET` to a long random value and keep it unchanged. If this value changes, existing admin sessions expire and the dashboard will ask you to login again.
 
@@ -52,6 +56,8 @@ https://kritechsolution.com
 Set `FRONTEND_URL` to the same public site URL so password reset emails generate the correct `/admin-reset` link.
 
 For reliable production mail, set `MAIL_PROVIDER=auto` and add either `RESEND_API_KEY` or `BREVO_API_KEY`. SMTP variables can stay as a fallback, but API mail avoids Railway-to-SMTP connection timeouts.
+
+The SMS API key is server-only. Add the SamayaSMS variables to Railway and never add them to Vercel or any `VITE_` variable. Because a key included in chat or documentation should be treated as exposed, rotate it in SamayaSMS before production use.
 
 ## Endpoints
 
@@ -80,3 +86,11 @@ For reliable production mail, set `MAIL_PROVIDER=auto` and add either `RESEND_AP
 - `DELETE /api/users/:id`
 - `GET /api/posts`
 - `GET /api/posts/:slug`
+- `GET /api/sms/overview`
+- `GET /api/sms/contacts`
+- `POST /api/sms/contacts/import`
+- `DELETE /api/sms/contacts/:id`
+- `GET /api/sms/campaigns`
+- `POST /api/sms/campaigns`
+- `GET /api/sms/campaigns/:id/deliveries`
+- `POST /api/sms/campaigns/:id/sync-dlr`
