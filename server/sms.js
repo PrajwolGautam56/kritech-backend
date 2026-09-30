@@ -1,17 +1,54 @@
 import { ObjectId } from 'mongodb';
 
-const SMS_API_URL = process.env.SAMAYA_SMS_API_URL || 'https://samayasms.com.np/smsapi/index.php';
-const SMS_API_KEY = process.env.SAMAYA_SMS_API_KEY || '';
-const SMS_CAMPAIGN_ID = process.env.SAMAYA_SMS_CAMPAIGN_ID || '';
-const SMS_ROUTE_ID = process.env.SAMAYA_SMS_ROUTE_ID || '10255';
-const SMS_SENDER_ID = process.env.SAMAYA_SMS_SENDER_ID || 'Bit_Alert';
 const SMS_REQUEST_TIMEOUT = Number(process.env.SAMAYA_SMS_TIMEOUT || 15000);
 const SMS_MAX_ATTEMPTS = Number(process.env.SAMAYA_SMS_MAX_ATTEMPTS || 3);
 const SMS_DLR_MAX_ATTEMPTS = Number(process.env.SAMAYA_SMS_DLR_MAX_ATTEMPTS || 10);
 
+const SMS_PROVIDERS = {
+  samaya: {
+    id: 'samaya',
+    name: 'SamayaSMS',
+    apiUrl: process.env.SAMAYA_SMS_API_URL || 'https://samayasms.com.np/smsapi/index.php',
+    apiKey: process.env.SAMAYA_SMS_API_KEY || '',
+    campaignId: process.env.SAMAYA_SMS_CAMPAIGN_ID || '',
+    routeId: process.env.SAMAYA_SMS_ROUTE_ID || '10255',
+    senderId: process.env.SAMAYA_SMS_SENDER_ID || 'Bit_Alert',
+    baseUrl: process.env.SAMAYA_SMS_BASE_URL || 'https://samayasms.com.np'
+  },
+  smsPasal: {
+    id: 'smsPasal',
+    name: 'SMS Pasal',
+    apiUrl: process.env.SMS_PASAL_API_URL || 'https://sms.smspasal.com/smsapi/index.php',
+    apiKey: process.env.SMS_PASAL_API_KEY || '',
+    campaignId: process.env.SMS_PASAL_CAMPAIGN_ID || '9835',
+    routeId: process.env.SMS_PASAL_ROUTE_ID || '10305',
+    senderId: process.env.SMS_PASAL_SENDER_ID || 'TN_ALERT',
+    baseUrl: process.env.SMS_PASAL_BASE_URL || 'https://sms.smspasal.com'
+  }
+};
+
 let workerRunning = false;
 let workerTimer = null;
-let providerSummaryCache = { expiresAt: 0, balance: null, lastTransaction: null, providerError: '' };
+const providerSummaryCache = new Map();
+
+function publicProvider(provider) {
+  return {
+    id: provider.id,
+    name: provider.name,
+    configured: Boolean(provider.apiKey && provider.senderId),
+    senderId: provider.senderId,
+    routeId: provider.routeId,
+    campaignId: provider.campaignId
+  };
+}
+
+function getProvider(providerId = 'samaya') {
+  return SMS_PROVIDERS[providerId] || null;
+}
+
+function configuredProviders() {
+  return Object.values(SMS_PROVIDERS).filter((provider) => provider.apiKey && provider.senderId);
+}
 
 function contactsCollection(db) {
   return db.collection('smsContacts');
@@ -76,38 +113,39 @@ function renderTemplate(template, contact) {
   return String(template || '').replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_match, key) => values[key] ?? '');
 }
 
-async function fetchText(url, options = {}, timeoutMs = SMS_REQUEST_TIMEOUT) {
+async function fetchText(url, options = {}, timeoutMs = SMS_REQUEST_TIMEOUT, providerName = 'SMS provider') {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
     const text = await response.text();
-    if (!response.ok) throw new Error(`SamayaSMS returned HTTP ${response.status}: ${text.slice(0, 180)}`);
+    if (!response.ok) throw new Error(`${providerName} returned HTTP ${response.status}: ${text.slice(0, 180)}`);
     return text;
   } catch (error) {
-    if (error.name === 'AbortError') throw new Error('SamayaSMS request timed out.');
+    if (error.name === 'AbortError') throw new Error(`${providerName} request timed out.`);
     throw error;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-function baseSmsParams(type, phone) {
+function baseSmsParams(provider, type, phone) {
   const params = new URLSearchParams({
-    key: SMS_API_KEY,
+    key: provider.apiKey,
     type,
     contacts: phone,
-    senderid: SMS_SENDER_ID,
+    senderid: provider.senderId,
     responsetype: 'json'
   });
-  if (SMS_CAMPAIGN_ID) params.set('campaign', SMS_CAMPAIGN_ID);
-  if (SMS_ROUTE_ID) params.set('routeid', SMS_ROUTE_ID);
+  if (provider.campaignId) params.set('campaign', provider.campaignId);
+  if (provider.routeId) params.set('routeid', provider.routeId);
   return params;
 }
 
 async function submitSms(delivery) {
-  if (!SMS_API_KEY) throw new Error('SAMAYA_SMS_API_KEY is not configured in Railway.');
-  const params = baseSmsParams(delivery.type, delivery.phone);
+  const provider = getProvider(delivery.providerId);
+  if (!provider?.apiKey) throw new Error(`SMS provider ${delivery.providerId || 'unknown'} is not configured in Railway.`);
+  const params = baseSmsParams(provider, delivery.type, delivery.phone);
   if (delivery.type === 'wap') {
     params.set('wap_title', delivery.payload.wapTitle || 'Open link');
     params.set('wap_url', delivery.payload.wapUrl);
@@ -124,11 +162,11 @@ async function submitSms(delivery) {
     params.set('msg', delivery.message);
   }
 
-  const raw = await fetchText(SMS_API_URL, {
+  const raw = await fetchText(provider.apiUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: params
-  });
+  }, SMS_REQUEST_TIMEOUT, provider.name);
   let parsed = null;
   try { parsed = JSON.parse(raw); } catch { parsed = null; }
   const resultText = typeof parsed === 'string' ? parsed : raw;
@@ -139,7 +177,7 @@ async function submitSms(delivery) {
   if (/^\s*ERR:/i.test(resultText) || parsed?.error) {
     throw new Error(String(parsed?.error || resultText).slice(0, 240));
   }
-  if (!shootMatch) throw new Error(`Unexpected SamayaSMS response: ${resultText.slice(0, 240)}`);
+  if (!shootMatch) throw new Error(`Unexpected ${provider.name} response: ${resultText.slice(0, 240)}`);
   return { shootId: shootMatch[1], providerResponse: parsed || raw };
 }
 
@@ -224,8 +262,10 @@ function dlrRetryDelay(attempts) {
   return (delays[Math.min(attempts, delays.length - 1)] || 720) * 60000;
 }
 
-async function fetchDeliveryReport(shootId, phone) {
-  const raw = await fetchText(`https://samayasms.com.np/miscapi/${encodeURIComponent(SMS_API_KEY)}/getDLR/${encodeURIComponent(shootId)}`);
+async function fetchDeliveryReport(providerId, shootId, phone) {
+  const provider = getProvider(providerId);
+  if (!provider?.apiKey) throw new Error(`SMS provider ${providerId || 'unknown'} is not configured.`);
+  const raw = await fetchText(`${provider.baseUrl}/miscapi/${encodeURIComponent(provider.apiKey)}/getDLR/${encodeURIComponent(shootId)}`, {}, SMS_REQUEST_TIMEOUT, provider.name);
   if (/^\s*ERR:/i.test(raw)) throw new Error(raw.trim());
   const reports = JSON.parse(raw);
   const report = Array.isArray(reports) ? reports.find((item) => cleanPhone(item.MSISDN) === phone) || reports[0] : null;
@@ -256,7 +296,7 @@ async function processNextDlr(getDb) {
 
   const attempts = Number(delivery.dlrAttempts || 0) + 1;
   try {
-    const result = await fetchDeliveryReport(delivery.shootId, delivery.phone);
+    const result = await fetchDeliveryReport(delivery.providerId || 'samaya', delivery.shootId, delivery.phone);
     if (result.terminal) {
       await deliveriesCollection(db).updateOne(
         { id: delivery.id },
@@ -287,7 +327,7 @@ function scheduleWorker(getDb, delayMs = 0) {
 }
 
 async function workerTick(getDb) {
-  if (workerRunning || !SMS_API_KEY) return;
+  if (workerRunning || !configuredProviders().length) return;
   workerRunning = true;
   let processed = 0;
   try {
@@ -307,47 +347,52 @@ async function workerTick(getDb) {
   }
 }
 
-async function getProviderSummary(force = false) {
-  if (!SMS_API_KEY) return { balance: null, lastTransaction: null, providerError: '' };
-  if (!force && providerSummaryCache.expiresAt > Date.now()) return providerSummaryCache;
+async function getProviderSummary(provider, force = false) {
+  if (!provider.apiKey) return { ...publicProvider(provider), balance: null, lastTransaction: null, providerError: '' };
+  const cached = providerSummaryCache.get(provider.id);
+  if (!force && cached?.expiresAt > Date.now()) return cached;
   let balance = null;
   let lastTransaction = null;
   let providerError = '';
   const [balanceResult, transactionResult] = await Promise.allSettled([
-    fetchText(`https://samayasms.com.np/miscapi/${encodeURIComponent(SMS_API_KEY)}/getBalance/true/`),
-    fetchText(`https://samayasms.com.np/lasttran/index.php?key=${encodeURIComponent(SMS_API_KEY)}`)
+    fetchText(`${provider.baseUrl}/miscapi/${encodeURIComponent(provider.apiKey)}/getBalance/true/`, {}, SMS_REQUEST_TIMEOUT, provider.name),
+    fetchText(`${provider.baseUrl}/lasttran/index.php?key=${encodeURIComponent(provider.apiKey)}`, {}, SMS_REQUEST_TIMEOUT, provider.name)
   ]);
   if (balanceResult.status === 'fulfilled') {
-    try { balance = JSON.parse(balanceResult.value); } catch { providerError = 'SamayaSMS returned an invalid balance response.'; }
+    try { balance = JSON.parse(balanceResult.value); } catch { providerError = `${provider.name} returned an invalid balance response.`; }
   } else {
     providerError = balanceResult.reason.message;
   }
   if (transactionResult.status === 'fulfilled') {
     try { lastTransaction = JSON.parse(transactionResult.value); } catch { lastTransaction = null; }
   }
-  providerSummaryCache = { expiresAt: Date.now() + 120000, balance, lastTransaction, providerError };
-  return providerSummaryCache;
+  const summary = { ...publicProvider(provider), expiresAt: Date.now() + 120000, balance, lastTransaction, providerError };
+  providerSummaryCache.set(provider.id, summary);
+  return summary;
 }
 
 async function getPortalData(db, forceProvider = false) {
-  const [contactCount, campaignCount, recentCampaigns, contacts, campaigns, provider] = await Promise.all([
+  const [contactCount, campaignCount, recentCampaigns, contacts, campaigns, providers] = await Promise.all([
     contactsCollection(db).countDocuments(),
     campaignsCollection(db).countDocuments(),
     campaignsCollection(db).find({}).sort({ createdAt: -1 }).limit(8).toArray(),
     contactsCollection(db).find({}).sort({ updatedAt: -1 }).limit(5000).toArray(),
     campaignsCollection(db).find({}).sort({ createdAt: -1 }).limit(100).toArray(),
-    getProviderSummary(forceProvider)
+    Promise.all(Object.values(SMS_PROVIDERS).map((provider) => getProviderSummary(provider, forceProvider)))
   ]);
+  const defaultProvider = providers.find((provider) => provider.configured) || providers[0];
   return {
     overview: {
-      configured: Boolean(SMS_API_KEY && SMS_SENDER_ID),
-      senderId: SMS_SENDER_ID,
-      routeId: SMS_ROUTE_ID,
+      configured: providers.some((provider) => provider.configured),
+      providerId: defaultProvider?.id,
+      senderId: defaultProvider?.senderId,
+      routeId: defaultProvider?.routeId,
       contactCount,
       campaignCount,
-      balance: provider.balance,
-      lastTransaction: provider.lastTransaction,
-      providerError: provider.providerError,
+      providers: providers.map(({ expiresAt, ...provider }) => provider),
+      balance: defaultProvider?.balance || null,
+      lastTransaction: defaultProvider?.lastTransaction || null,
+      providerError: providers.map((provider) => provider.providerError).filter(Boolean).join(' '),
       recentCampaigns: recentCampaigns.map(withoutMongoId)
     },
     contacts: contacts.map(withoutMongoId),
@@ -376,8 +421,9 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
         campaignsCollection(db).countDocuments(),
         campaignsCollection(db).find({}).sort({ createdAt: -1 }).limit(8).toArray()
       ]);
-      const { balance, lastTransaction, providerError } = await getProviderSummary(request.query.refresh === '1');
-      response.json({ configured: Boolean(SMS_API_KEY && SMS_SENDER_ID), senderId: SMS_SENDER_ID, routeId: SMS_ROUTE_ID, contactCount, campaignCount, balance, lastTransaction, providerError, recentCampaigns: recentCampaigns.map(withoutMongoId) });
+      const providers = await Promise.all(Object.values(SMS_PROVIDERS).map((provider) => getProviderSummary(provider, request.query.refresh === '1')));
+      const defaultProvider = providers.find((provider) => provider.configured) || providers[0];
+      response.json({ configured: providers.some((provider) => provider.configured), providerId: defaultProvider?.id, senderId: defaultProvider?.senderId, routeId: defaultProvider?.routeId, providers: providers.map(({ expiresAt, ...provider }) => provider), contactCount, campaignCount, balance: defaultProvider?.balance || null, lastTransaction: defaultProvider?.lastTransaction || null, providerError: providers.map((provider) => provider.providerError).filter(Boolean).join(' '), recentCampaigns: recentCampaigns.map(withoutMongoId) });
     } catch (error) {
       response.status(500).json({ message: error.message });
     }
@@ -470,7 +516,10 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
 
   app.post('/api/sms/campaigns', ...protect, async (request, response) => {
     try {
-      if (!SMS_API_KEY) return response.status(503).json({ message: 'SMS API is not configured in Railway.' });
+      const providerId = String(request.body?.providerId || 'samaya');
+      const provider = getProvider(providerId);
+      if (!provider) return response.status(400).json({ message: 'Unknown SMS provider.' });
+      if (!provider.apiKey || !provider.senderId) return response.status(503).json({ message: `${provider.name} is not configured in Railway.` });
       const type = String(request.body?.type || 'text').toLowerCase();
       if (!['text', 'unicode', 'flash', 'wap', 'vcard'].includes(type)) return response.status(400).json({ message: 'Unsupported SMS type.' });
       const contactIds = Array.isArray(request.body?.contactIds) ? request.body.contactIds : [];
@@ -492,6 +541,9 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
       const campaign = {
         id: new ObjectId().toString(),
         name: String(request.body?.name || `${type.toUpperCase()} campaign`).trim(),
+        providerId: provider.id,
+        providerName: provider.name,
+        senderId: provider.senderId,
         type,
         template,
         payload,
@@ -519,6 +571,8 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
           name: contact.name,
           phone: contact.phone,
           group: contact.group,
+          providerId: provider.id,
+          providerName: provider.name,
           type: type === 'text' && /[^\x00-\x7F]/.test(message) ? 'unicode' : type,
           message,
           payload,
@@ -541,14 +595,13 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
 
   app.post('/api/sms/campaigns/:id/sync-dlr', ...protect, async (request, response) => {
     try {
-      if (!SMS_API_KEY) return response.status(503).json({ message: 'SMS API is not configured.' });
       const db = await getDb();
       const deliveries = await deliveriesCollection(db).find({ campaignId: request.params.id, status: { $in: ['submitted', 'dlr_unavailable'] }, shootId: { $ne: '' } }).limit(1000).toArray();
       let delivered = 0;
       let failed = 0;
       for (const delivery of deliveries) {
         try {
-          const result = await fetchDeliveryReport(delivery.shootId, delivery.phone);
+          const result = await fetchDeliveryReport(delivery.providerId || 'samaya', delivery.shootId, delivery.phone);
           if (!result.terminal) continue;
           await deliveriesCollection(db).updateOne({ id: delivery.id }, { $set: { status: result.delivered ? 'delivered' : 'delivery_failed', dlr: result.report, dlrCheckedAt: new Date(), dlrLockedAt: null, updatedAt: new Date() } });
           if (result.delivered) delivered += 1;
