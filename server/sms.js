@@ -24,7 +24,7 @@ const SMS_PROVIDERS = {
     apiUrl: process.env.SMS_PASAL_API_URL || 'https://sms.smspasal.com/smsapi/index.php',
     apiKey: process.env.SMS_PASAL_API_KEY || '',
     campaignId: process.env.SMS_PASAL_CAMPAIGN_ID || '9835',
-    routeId: process.env.SMS_PASAL_ROUTE_ID || '10305',
+    routeId: '10259',
     senderId: 'TN_Alert',
     baseUrl: process.env.SMS_PASAL_BASE_URL || 'https://sms.smspasal.com',
     driver: 'smspasal',
