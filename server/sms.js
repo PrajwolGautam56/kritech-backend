@@ -245,6 +245,25 @@ async function updateCampaignAfterDelivery(db, campaignId, status, errorMessage 
   }
 }
 
+async function includeCampaignErrors(db, campaigns) {
+  const missingErrorIds = campaigns
+    .filter((campaign) => Number(campaign.failed || 0) > 0 && !campaign.lastError)
+    .map((campaign) => campaign.id);
+  if (!missingErrorIds.length) return campaigns.map(withoutMongoId);
+
+  const latestErrors = await deliveriesCollection(db).aggregate([
+    { $match: { campaignId: { $in: missingErrorIds }, error: { $exists: true, $nin: ['', null] } } },
+    { $sort: { updatedAt: -1 } },
+    { $group: { _id: '$campaignId', lastError: { $first: '$error' } } }
+  ]).toArray();
+  const errorsByCampaign = new Map(latestErrors.map((item) => [item._id, item.lastError]));
+
+  return campaigns.map((campaign) => withoutMongoId({
+    ...campaign,
+    lastError: campaign.lastError || errorsByCampaign.get(campaign.id) || ''
+  }));
+}
+
 async function refreshCampaignTracking(db, campaignId) {
   const counts = await deliveriesCollection(db).aggregate([
     { $match: { campaignId } },
@@ -442,6 +461,10 @@ async function getPortalData(db, forceProvider = false) {
     Promise.all(Object.values(SMS_PROVIDERS).map((provider) => getProviderSummary(provider, forceProvider)))
   ]);
   const defaultProvider = providers.find((provider) => provider.configured) || providers[0];
+  const [recentCampaignResults, campaignResults] = await Promise.all([
+    includeCampaignErrors(db, recentCampaigns),
+    includeCampaignErrors(db, campaigns)
+  ]);
   return {
     overview: {
       configured: providers.some((provider) => provider.configured),
@@ -454,10 +477,10 @@ async function getPortalData(db, forceProvider = false) {
       balance: defaultProvider?.balance || null,
       lastTransaction: defaultProvider?.lastTransaction || null,
       providerError: providers.map((provider) => provider.providerError).filter(Boolean).join(' '),
-      recentCampaigns: recentCampaigns.map(withoutMongoId)
+      recentCampaigns: recentCampaignResults
     },
     contacts: contacts.map(withoutMongoId),
-    campaigns: campaigns.map(withoutMongoId)
+    campaigns: campaignResults
   };
 }
 
@@ -484,7 +507,7 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
       ]);
       const providers = await Promise.all(Object.values(SMS_PROVIDERS).map((provider) => getProviderSummary(provider, request.query.refresh === '1')));
       const defaultProvider = providers.find((provider) => provider.configured) || providers[0];
-      response.json({ configured: providers.some((provider) => provider.configured), providerId: defaultProvider?.id, senderId: defaultProvider?.senderId, routeId: defaultProvider?.routeId, providers: providers.map(({ expiresAt, ...provider }) => provider), contactCount, campaignCount, balance: defaultProvider?.balance || null, lastTransaction: defaultProvider?.lastTransaction || null, providerError: providers.map((provider) => provider.providerError).filter(Boolean).join(' '), recentCampaigns: recentCampaigns.map(withoutMongoId) });
+      response.json({ configured: providers.some((provider) => provider.configured), providerId: defaultProvider?.id, senderId: defaultProvider?.senderId, routeId: defaultProvider?.routeId, providers: providers.map(({ expiresAt, ...provider }) => provider), contactCount, campaignCount, balance: defaultProvider?.balance || null, lastTransaction: defaultProvider?.lastTransaction || null, providerError: providers.map((provider) => provider.providerError).filter(Boolean).join(' '), recentCampaigns: await includeCampaignErrors(db, recentCampaigns) });
     } catch (error) {
       response.status(500).json({ message: error.message });
     }
@@ -503,7 +526,7 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
     try {
       const db = await getDb();
       const campaigns = await campaignsCollection(db).find({}).sort({ createdAt: -1 }).limit(100).toArray();
-      response.json(campaigns.map(withoutMongoId));
+      response.json(await includeCampaignErrors(db, campaigns));
     } catch (error) {
       response.status(500).json({ message: error.message });
     }
@@ -559,7 +582,7 @@ export function registerSmsRoutes(app, { getDb, requireAdmin, requirePermission 
     try {
       const db = await getDb();
       const campaigns = await campaignsCollection(db).find({}).sort({ createdAt: -1 }).limit(100).toArray();
-      response.json(campaigns.map(withoutMongoId));
+      response.json(await includeCampaignErrors(db, campaigns));
     } catch (error) {
       response.status(500).json({ message: error.message });
     }
