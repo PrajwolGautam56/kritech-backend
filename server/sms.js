@@ -71,6 +71,12 @@ function configuredProviders() {
   return Object.values(SMS_PROVIDERS).filter((provider) => provider.apiKey);
 }
 
+function providerError(message, retryable = true) {
+  const error = new Error(String(message || 'SMS provider rejected the request.').slice(0, 240));
+  error.retryable = retryable;
+  return error;
+}
+
 function contactsCollection(db) {
   return db.collection('smsContacts');
 }
@@ -208,6 +214,9 @@ async function submitSms(delivery) {
   try { parsed = JSON.parse(raw); } catch { parsed = null; }
   const resultText = typeof parsed === 'string' ? parsed : raw;
   const parsedText = parsed ? JSON.stringify(parsed) : resultText;
+  if (Number(parsed?.response_code) >= 400) {
+    throw providerError(`${provider.name}: ${parsed.message || `request rejected (${parsed.response_code})`}`, false);
+  }
   const shootMatch = resultText.match(/SMS-SHOOT-ID\/([a-zA-Z0-9_-]+)/i)
     || parsedText.match(/SMS-SHOOT-ID[\\/\":\s]+([a-zA-Z0-9_-]+)/i)
     || String(parsed?.shoot_id || parsed?.shootId || parsed?.data?.shoot_id || '').match(/([a-zA-Z0-9_-]+)/);
@@ -218,12 +227,14 @@ async function submitSms(delivery) {
   return { shootId: shootMatch[1], providerResponse: parsed || raw, supportsDlr: provider.supportsDlr };
 }
 
-async function updateCampaignAfterDelivery(db, campaignId, status) {
+async function updateCampaignAfterDelivery(db, campaignId, status, errorMessage = '') {
   const increment = { processed: 1 };
   increment[status === 'submitted' ? 'submitted' : 'failed'] = 1;
+  const patch = { updatedAt: new Date() };
+  if (errorMessage) patch.lastError = errorMessage;
   const campaign = await campaignsCollection(db).findOneAndUpdate(
     { id: campaignId },
-    { $inc: increment, $set: { updatedAt: new Date() } },
+    { $inc: increment, $set: patch },
     { returnDocument: 'after' }
   );
   if (campaign && campaign.processed >= campaign.total) {
@@ -280,7 +291,7 @@ async function processNextDelivery(getDb) {
     if (result.supportsDlr === false) await refreshCampaignTracking(db, delivery.campaignId);
   } catch (error) {
     const attempts = Number(delivery.attempts || 0) + 1;
-    if (attempts < SMS_MAX_ATTEMPTS) {
+    if (attempts < SMS_MAX_ATTEMPTS && error.retryable !== false) {
       await deliveriesCollection(db).updateOne(
         { id: delivery.id },
         { $set: { status: 'queued', attempts, error: error.message, nextAttemptAt: new Date(Date.now() + attempts * 30000), lockedAt: null, updatedAt: new Date() } }
@@ -290,7 +301,7 @@ async function processNextDelivery(getDb) {
         { id: delivery.id },
         { $set: { status: 'failed', attempts, error: error.message, failedAt: new Date(), lockedAt: null, updatedAt: new Date() } }
       );
-      await updateCampaignAfterDelivery(db, delivery.campaignId, 'failed');
+      await updateCampaignAfterDelivery(db, delivery.campaignId, 'failed', error.message);
     }
   }
   return true;
