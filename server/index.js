@@ -585,6 +585,23 @@ app.get('/api/content', async (_request, response) => {
   try {
     const db = await getDb();
     const [posts, seoDoc] = await Promise.all([
+      postsCollection(db).find({ status: 'Published' }).sort({ date: -1, updatedAt: -1 }).toArray(),
+      seoCollection(db).findOne({ key: 'siteSeo' })
+    ]);
+
+    response.json({
+      posts: posts.map(serializePost),
+      seo: seoDoc?.items || {}
+    });
+  } catch (error) {
+    response.status(500).json({ message: error.message });
+  }
+});
+
+app.get('/api/admin/content', requireAdmin, requireAnyPermission(['posts', 'seo']), async (_request, response) => {
+  try {
+    const db = await getDb();
+    const [posts, seoDoc] = await Promise.all([
       postsCollection(db).find({}).sort({ date: -1, updatedAt: -1 }).toArray(),
       seoCollection(db).findOne({ key: 'siteSeo' })
     ]);
@@ -978,7 +995,7 @@ app.delete('/api/users/:id', requireAdmin, requireSuperAdmin, async (request, re
 app.get('/api/posts', async (_request, response) => {
   try {
     const db = await getDb();
-    const posts = await postsCollection(db).find({}).sort({ date: -1, updatedAt: -1 }).toArray();
+    const posts = await postsCollection(db).find({ status: 'Published' }).sort({ date: -1, updatedAt: -1 }).toArray();
     response.json(posts.map(serializePost));
   } catch (error) {
     response.status(500).json({ message: error.message });
@@ -988,7 +1005,7 @@ app.get('/api/posts', async (_request, response) => {
 app.get('/api/posts/:slug', async (request, response) => {
   try {
     const db = await getDb();
-    const post = await postsCollection(db).findOne({ slug: request.params.slug });
+    const post = await postsCollection(db).findOne({ slug: request.params.slug, status: 'Published' });
     if (!post) {
       response.status(404).json({ message: 'Post not found' });
       return;
