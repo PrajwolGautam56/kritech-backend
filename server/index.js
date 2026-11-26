@@ -297,6 +297,10 @@ function normalizeInquiry(body = {}, request) {
     contact: String(body.contact || '').trim(),
     service: String(body.service || '').trim(),
     location: String(body.location || '').trim(),
+    role: String(body.role || '').trim(),
+    phone: String(body.phone || '').trim(),
+    portfolio: String(body.portfolio || '').trim(),
+    resume: String(body.resume || '').trim(),
     message: String(body.message || '').trim(),
     sourcePage: String(body.sourcePage || '').trim(),
     status: 'New',
@@ -656,6 +660,33 @@ app.post('/api/inquiries', async (request, response) => {
 
     const db = await getDb();
     await inquiriesCollection(db).insertOne(inquiry);
+
+    if (inquiry.service === 'Career Application' && adminEmail) {
+      const details = [
+        `Name: ${inquiry.name}`,
+        `Email: ${inquiry.contact}`,
+        `Phone: ${inquiry.phone || 'Not provided'}`,
+        `Role: ${inquiry.role || 'Not selected'}`,
+        `Portfolio: ${inquiry.portfolio || 'Not provided'}`,
+        `Resume: ${inquiry.resume || 'Not provided'}`,
+        '',
+        'Why they are a good fit:',
+        inquiry.message,
+        '',
+        `Source: ${inquiry.sourcePage || 'Careers page'}`
+      ].join('\n');
+
+      try {
+        await sendMail({
+          to: adminEmail,
+          subject: `New career application: ${inquiry.role || 'Kritech role'}`,
+          text: details
+        });
+      } catch (error) {
+        console.error(`Career application email failed: ${error.message}`);
+      }
+    }
+
     response.status(201).json({
       ok: true,
       inquiry: serializeInquiry(inquiry)
