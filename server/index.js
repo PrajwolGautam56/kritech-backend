@@ -661,6 +661,11 @@ app.post('/api/inquiries', async (request, response) => {
     const db = await getDb();
     await inquiriesCollection(db).insertOne(inquiry);
 
+    response.status(201).json({
+      ok: true,
+      inquiry: serializeInquiry(inquiry)
+    });
+
     if (inquiry.service === 'Career Application' && adminEmail) {
       const details = [
         `Name: ${inquiry.name}`,
@@ -676,21 +681,12 @@ app.post('/api/inquiries', async (request, response) => {
         `Source: ${inquiry.sourcePage || 'Careers page'}`
       ].join('\n');
 
-      try {
-        await sendMail({
-          to: adminEmail,
-          subject: `New career application: ${inquiry.role || 'Kritech role'}`,
-          text: details
-        });
-      } catch (error) {
-        console.error(`Career application email failed: ${error.message}`);
-      }
+      sendMail({
+        to: adminEmail,
+        subject: `New career application: ${inquiry.role || 'Kritech role'}`,
+        text: details
+      }).catch((error) => console.error(`Career application email failed: ${error.message}`));
     }
-
-    response.status(201).json({
-      ok: true,
-      inquiry: serializeInquiry(inquiry)
-    });
   } catch (error) {
     response.status(500).json({ message: error.message });
   }
