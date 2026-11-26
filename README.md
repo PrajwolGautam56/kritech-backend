@@ -28,6 +28,7 @@ Required production variables:
 - `CLOUDINARY_API_SECRET`
 - `CLOUDINARY_UPLOAD_FOLDER`
 - `MAIL_FROM`
+- `CAREER_EMAIL` (defaults to `ADMIN_EMAIL`, then `info@kritechsolution.com`)
 - `ADMIN_EMAIL`
 - `ADMIN_PASSWORD_SALT`
 - `ADMIN_PASSWORD_HASH`

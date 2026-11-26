@@ -18,6 +18,7 @@ const cloudinaryApiKey = process.env.CLOUDINARY_API_KEY;
 const cloudinaryApiSecret = process.env.CLOUDINARY_API_SECRET;
 const cloudinaryUploadFolder = process.env.CLOUDINARY_UPLOAD_FOLDER || 'kritech/blog';
 const adminEmail = process.env.ADMIN_EMAIL;
+const careerEmail = process.env.CAREER_EMAIL || adminEmail || 'info@kritechsolution.com';
 const adminPasswordSalt = process.env.ADMIN_PASSWORD_SALT;
 const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
 const adminTokenSecret = process.env.ADMIN_TOKEN_SECRET
@@ -666,7 +667,7 @@ app.post('/api/inquiries', async (request, response) => {
       inquiry: serializeInquiry(inquiry)
     });
 
-    if (inquiry.service === 'Career Application' && adminEmail) {
+    if (inquiry.service === 'Career Application' && careerEmail) {
       const details = [
         `Name: ${inquiry.name}`,
         `Email: ${inquiry.contact}`,
@@ -682,7 +683,7 @@ app.post('/api/inquiries', async (request, response) => {
       ].join('\n');
 
       sendMail({
-        to: adminEmail,
+        to: careerEmail,
         subject: `New career application: ${inquiry.role || 'Kritech role'}`,
         text: details
       }).catch((error) => console.error(`Career application email failed: ${error.message}`));
